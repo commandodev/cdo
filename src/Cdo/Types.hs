@@ -12,23 +12,19 @@
 module Cdo.Types
 
        where
-import           Control.Applicative
+-- import           Control.Applicative
 import           Control.Exception          (Exception (..))
 import           Control.Lens
-import           Control.Monad.Free
-import           Control.Monad.IO.Class     (MonadIO, liftIO)
-import           Control.Monad.Trans.Either (EitherT, left, right)
-import           Control.Monad.Trans.Reader (ReaderT, asks)
 import           Data.Aeson                 (FromJSON (..), ToJSON (..))
 import qualified Data.Aeson                 as Aeson
 import Data.ByteString (ByteString)
 import           Data.Data                  (Data, Typeable)
 import           Data.Text                  (Text)
-import qualified Data.Text                  as T
+--import qualified Data.Text                  as T
 import qualified Data.Text.Encoding         as T
 import           Data.UUID                  (UUID)
 import qualified Data.UUID                  as UUID
-import qualified Data.UUID.V4               as UUID
+-- import qualified Data.UUID.V4               as UUID
 import qualified Database.Redis             as Redis
 import           GHC.Generics
 
@@ -43,6 +39,8 @@ makeLenses ''Env
 data AccountException =
     AccountAlreadyExists
   | AccountBalanceInsufficient
+  | AccountBalanceNotFound AccountId
+  | AccountStillHasBalance AccountId
   deriving (Show, Typeable)
 
 instance Exception AccountException
@@ -76,14 +74,14 @@ instance FromJSON Account
 
 data CommandF n =
     Open AccountName (Account -> n)
-  | Close Account n
+  | Close AccountId n
   | Debit AccountId Double n
   | Credit AccountId Double n
   deriving (Functor)
 
 data Event =
     AccountOpened Account
-  | AccountClosed Account
+  | AccountClosed AccountId
   | AccountDebited AccountId Amount
   | AccountCredited AccountId Amount
   deriving (Show, Data, Generic, Typeable) -- , ToJSON, FromJSON)
@@ -91,6 +89,15 @@ data Event =
 -- mkCmd f = liftF $! f id
 instance ToJSON Event
 instance FromJSON Event
+
+data LoggedEvent = LoggedEvent {
+    _ts :: ()
+  , _event :: Event
+  } deriving (Show, Data, Generic, Typeable)
+
+
+instance ToJSON LoggedEvent
+instance FromJSON LoggedEvent
 
 instance ToJSON AccountId where
   toJSON = toJSON . T.decodeUtf8 . UUID.toASCIIBytes . unaccId
