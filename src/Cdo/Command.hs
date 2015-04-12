@@ -21,7 +21,7 @@ import qualified Control.Monad.Trans.Free    as FT
 -- import           Control.Monad.IO.Class     (MonadIO, liftIO)
 import           Control.Monad.Reader.Class (MonadReader (..))
 -- import           Control.Monad.Trans.Class  (MonadTrans, lift)
-import           Control.Monad.Trans.Either (EitherT (..), left, eitherT)
+import           Control.Monad.Trans.Either (EitherT (..), left, eitherT, hoistEither)
 import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
 -- import           Data.Aeson                 (FromJSON (..), ToJSON (..))
 -- import qualified Data.Aeson                 as Aeson
@@ -169,8 +169,10 @@ runSingle = go
                return nxt
 
 ---------------------------------------------------------------------------------
-applyEvent :: Redis.Connection -> Event -> m ()
-applyEvent con _evt = undefined
+applyEvent :: (MonadIO m) => Redis.Connection -> Event -> m (Either (CommandError SomeException) ())
+applyEvent con evt = do
+  liftIO $ putStrLn $ "APPLY: " ++ (show evt)
+  return $ Right ()
 
 
 ---------------------------------------------------------------------------------
@@ -180,22 +182,31 @@ run
   :: forall a m .(Functor m, Applicative m, MonadIO m)
   => Env
   -> FreeCMD m a
-  -> m (Either (CommandError SomeException) a)
+  -> m (Either (CommandError SomeException) ())
 run env@(Env con) ftc = do
-  step ftc
+  res <- runCommandT (step ftc) env
+  case res of
+    Left err -> do
+      liftIO $ print err
+      return $ Left err
+    Right _ -> return $ Right ()
+  --runEffect $ for cmdRes $ \a -> lift $ print a
   -- runEffect ((void <$> evts) >-> writeEvents con)
   where
-    step :: FreeCMD m b -> m (Either (CommandError SomeException) b)
+    step :: (MonadIO m) => FreeCMD m a -> CommandT SomeException m a
     step (FT.FreeT cmd') = do
-      cmd <- do
-        prod <- runCommandT cmd' env
-        liftIO $ runEffect (for prod) $ \evt -> do
-          applyEvent con evt
-          logEvent con (LoggedEvent () evt)
+      cmd <- runProducer cmd' (const $ return ())
       case cmd of
         FT.Pure a -> return a
-        FT.Free c -> step =<< runSingle c
+        FT.Free c -> do
+          let sngl = runSingle c
+          step =<< runProducer sngl (applyAndLog con)
 
+applyAndLog :: MonadIO m => Redis.Connection -> Event -> m ()
+applyAndLog con evt = do
+  _ <- applyEvent con evt
+  logEvent con (LoggedEvent () evt)
+  return ()
 
 logEvent :: MonadIO m => Redis.Connection -> LoggedEvent -> m (Either (CommandError SomeException) ())
 logEvent con evt =
@@ -219,3 +230,9 @@ main = do
   env <- Env <$> Redis.connect Redis.defaultConnectInfo
   print =<< run env mainM
 
+runProducer :: (MonadIO m) => CommandMonad er evt m a -> (evt -> Effect m ()) -> CommandT er m a
+runProducer m eff = do
+  env <- ask
+  let prod = runCommandT m env
+  res <- lift $ runEffect $ for prod eff
+  CommandT $ hoistEither res
