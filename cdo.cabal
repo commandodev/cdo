@@ -27,6 +27,7 @@ library
                      , attoparsec >= 0.12.1.5
                      , base
                      , bytestring >= 0.10.4.0
+                     , containers >= 0.5.5.1
                      , either >= 4.3.3.2
                      , free
                      , hedis >= 0.6.5
@@ -49,6 +50,7 @@ test-suite tests
   build-depends:       base
                      , bytestring >= 0.10.4.0
                      , cdo == 0.1.0.0
+                     , containers >= 0.5.5.1
                      , tasty >= 0.10.1
                      , tasty-hspec >= 1.1
                      , tasty-quickcheck >= 0.8.3.2
