@@ -12,38 +12,44 @@
 {-# LANGUAGE TypeFamilies               #-}
 module Cdo.Command where
 import           Control.Applicative
-import           Control.Exception          (Exception (..), SomeException, toException)
+import           Control.Exception          (Exception (..), SomeException,
+                                             toException)
 
 import           Control.Lens
 import           Control.Monad.Free
 -- import           Control.Monad (forever)
-import qualified Control.Monad.Trans.Free    as FT
+import qualified Control.Monad.Trans.Free   as FT
+import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
 -- import           Control.Monad.IO.Class     (MonadIO, liftIO)
 import           Control.Monad.Reader.Class (MonadReader (..))
 -- import           Control.Monad.Trans.Class  (MonadTrans, lift)
-import           Control.Monad.Trans.Either (EitherT (..), left, eitherT, hoistEither)
-import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import           Control.Monad.RWS.Strict   (MonadReader (..), MonadState (..),
+                                             MonadWriter (..), RWST (..), tell)
+import           Control.Monad.Trans.Either (EitherT (..), eitherT, hoistEither,
+                                             left)
 -- import           Data.Aeson                 (FromJSON (..), ToJSON (..))
--- import qualified Data.Aeson                 as Aeson
 import           Data.Data                  (Typeable)
+import qualified Data.Sequence              as Seq
 import           Data.Text                  (Text)
 -- import qualified Data.Text                  as T
 -- import qualified Data.Text.Encoding         as T
 -- import           Data.UUID                  (UUID)
 -- import qualified Data.UUID                  as UUID
+import           Cdo.Query
+import           Cdo.Types
+import           Cdo.Write
 import qualified Data.UUID.V4               as UUID
 import           Database.Redis             (Redis)
 import qualified Database.Redis             as Redis
 import           GHC.Generics
-import Pipes
-import           Cdo.Query
-import           Cdo.Types
-import Cdo.Write
+import           Pipes
 
 
 newtype Query a = Query { unQuery :: (Redis a) } deriving (Functor, Applicative, Monad)
 
-runQuery :: MonadIO m => Redis a -> CommandT err m a
+type CmdResult = Either (CommandError SomeException)
+
+runQuery :: MonadIO m => Redis a -> CommandT err evt m a
 runQuery q = do
   rCon <- view conn <$> ask
   liftIO $ Redis.runRedis rCon q
@@ -51,13 +57,13 @@ runQuery q = do
 redisQuery
   :: MonadIO m
   => Redis (Either Redis.Reply a)
-  -> (a -> CommandT SomeException m b)
-  -> CommandT SomeException m b
+  -> (a -> CommandT SomeException evt m b)
+  -> CommandT SomeException evt m b
 redisQuery q f = eitherT queryError f (EitherT $ runQuery q)
 
 ---------------------------------------------------------------------------------
-yieldEvent :: Monad m => evt -> CommandMonad err evt m ()
-yieldEvent evt = CommandT . lift . lift $ yield evt
+yieldEvent :: Monad m => evt -> CommandT err evt m ()
+yieldEvent evt = CommandT $ lift  $ tell $ Seq.singleton evt
 
 openAccount :: MonadFree CommandF m => AccountName -> m Account
 openAccount acc = liftF $! Open acc id
@@ -85,42 +91,45 @@ data EventError e =
   deriving (Show, Typeable, Generic)
 
 
-newtype CommandT err m a = CommandT {
-    unCommand :: EitherT (CommandError err) (ReaderT Env m) a
+newtype CommandT err evt m a = CommandT {
+    unCommand :: EitherT (CommandError err) (RWST Env (Seq.Seq evt) () m) a
   } deriving (Functor, Applicative, Monad, MonadIO)
 
-type CommandMonad err evt m a = CommandT err (Producer evt m) a
-type EventMonad err evt m a = CommandT err (Consumer evt m) a
 
 runCommandT
-  :: CommandT e m a
+  :: CommandT err evt m a
   -> Env
-  -> m (Either (CommandError e) a)
-runCommandT = runReaderT . runEitherT . unCommand
+  -> ()
+  -> m (Either (CommandError err) a, (), Seq.Seq evt)
+runCommandT = runRWST . runEitherT . unCommand
 
-instance MonadTrans (CommandT err) where
+instance MonadTrans (CommandT err evt) where
   lift = CommandT . lift . lift
 
-instance (Monad m) => MonadReader Env (CommandT err m) where
+-- instance (Monad m) => MonadState CState (CommanderT e m) where
+--   get = CommanderT (lift get)
+--   put = CommanderT . lift . put
+
+instance (Monad m) => MonadReader Env (CommandT err evt m) where
   ask     = CommandT (lift ask)
   local f = CommandT . local f . unCommand
 
-instance (Monad m) => Alternative (CommandT err m) where
+instance (Monad m) => Alternative (CommandT err evt m) where
   empty = CommandT . left $ CommandError "empty"
   CommandT (EitherT m1) <|> CommandT (EitherT m2) =
      CommandT $ EitherT $ m1 >>= either (\_ -> m2) (return . Right)
 
 ---------------------------------------------------------------------------------
-businessLogicError :: Monad m => err -> CommandT err m a
+businessLogicError :: Monad m => err -> CommandT err evt m a
 businessLogicError = CommandT . left . BusinessLogicError
 
-queryError :: Monad m => Redis.Reply -> CommandT SomeException m a
+queryError :: Monad m => Redis.Reply -> CommandT SomeException evt m a
 queryError r = CommandT . left . QueryError . toException $ QueryException err
   where err = case r of
                 Redis.Error e -> e
                 _             -> "Something went wrong with redis"
 
-writeError :: Monad m => Redis.Reply -> EventMonad SomeException evt m a
+writeError :: Monad m => Redis.Reply -> CommandT SomeException evt m a
 writeError r = CommandT . left . QueryError . toException $ QueryException err
   where err = case r of
                 Redis.Error e -> e
@@ -128,10 +137,10 @@ writeError r = CommandT . left . QueryError . toException $ QueryException err
 
 
 ---------------------------------------------------------------------------------
-runSingle :: forall a m. (MonadIO m) => CommandF a -> CommandMonad SomeException Event m a
+runSingle :: forall a m. (MonadIO m) => CommandF a -> CommandT SomeException Event m a
 runSingle = go
   where
-    go :: CommandF a -> CommandMonad SomeException Event m a
+    go :: CommandF a -> CommandT SomeException Event m a
     go (Open name f) = redisQuery (accountExists name) $ \exists ->
       if exists
         then businessLogicError $ toException AccountAlreadyExists
@@ -169,22 +178,35 @@ runSingle = go
                return nxt
 
 ---------------------------------------------------------------------------------
-applyEvent :: (MonadIO m) => Redis.Connection -> Event -> m (Either (CommandError SomeException) ())
+applyEvent :: forall m. (MonadIO m) => Redis.Connection -> Event -> m (CmdResult ())
 applyEvent con evt = do
-  liftIO $ putStrLn $ "APPLY: " ++ (show evt)
-  return $ Right ()
+  case evt of
+    AccountOpened acc -> apply (writeAccount acc)
+    AccountCredited aid amt -> apply (saveAmount aid amt)
+  where
+    apply :: Redis (Either Redis.Reply a) -> m (CmdResult ())
+    apply q =
+       runEitherT $ eitherT
+         writeError'
+         (const $ return ())
+         (EitherT $ liftIO $  Redis.runRedis con $ q)
+       where
+         writeError' r = left . QueryError . toException $ QueryException err
+           where err = case r of
+                     Redis.Error e -> e
+                     _             -> "Something went wrong with redis"
 
 
 ---------------------------------------------------------------------------------
-type FreeCMD m = FT.FreeT CommandF (CommandT SomeException (Producer Event m))
+type FreeCMD m = FT.FreeT CommandF (CommandT SomeException Event m)
 
 run
   :: forall a m .(Functor m, Applicative m, MonadIO m)
   => Env
   -> FreeCMD m a
-  -> m (Either (CommandError SomeException) ())
+  -> m (CmdResult ())
 run env@(Env con) ftc = do
-  res <- runCommandT (step ftc) env
+  (res, _, evts) <- runCommandT (step ftc) env ()
   case res of
     Left err -> do
       liftIO $ print err
@@ -193,22 +215,25 @@ run env@(Env con) ftc = do
   --runEffect $ for cmdRes $ \a -> lift $ print a
   -- runEffect ((void <$> evts) >-> writeEvents con)
   where
-    step :: (MonadIO m) => FreeCMD m a -> CommandT SomeException m a
+    step :: (MonadIO m) => FreeCMD m a -> CommandT SomeException evt m a
     step (FT.FreeT cmd') = do
-      cmd <- runProducer cmd' (const $ return ())
+      cmd <- runProducer cmd' undefined -- (const $ return ())
       case cmd of
         FT.Pure a -> return a
         FT.Free c -> do
           let sngl = runSingle c
           step =<< runProducer sngl (applyAndLog con)
 
-applyAndLog :: MonadIO m => Redis.Connection -> Event -> m ()
-applyAndLog con evt = do
-  _ <- applyEvent con evt
-  logEvent con (LoggedEvent () evt)
-  return ()
+applyAndLog :: MonadIO m => Redis.Connection -> Event -> EventMonad m (CmdResult a)
+applyAndLog evt = do
+  
+  lift $ do
+    applyEvent con evt
+    logEvent con (LoggedEvent () evt)
 
-logEvent :: MonadIO m => Redis.Connection -> LoggedEvent -> m (Either (CommandError SomeException) ())
+type EventMonad = ReaderT Redis.Connection
+
+logEvent :: MonadIO m => Redis.Connection -> LoggedEvent -> m (CmdResult ())
 logEvent con evt =
   runEitherT $ eitherT
     writeError'
@@ -230,9 +255,9 @@ main = do
   env <- Env <$> Redis.connect Redis.defaultConnectInfo
   print =<< run env mainM
 
-runProducer :: (MonadIO m) => CommandMonad er evt m a -> (evt -> Effect m ()) -> CommandT er m a
+runProducer :: (MonadIO m) => CommandT SomeException evt m a -> Consumer evt m (CmdResult a) -> CommandT SomeException evt m a
 runProducer m eff = do
   env <- ask
   let prod = runCommandT m env
-  res <- lift $ runEffect $ for prod eff
+  res <- lift $ runEffect $ prod >-> eff
   CommandT $ hoistEither res
