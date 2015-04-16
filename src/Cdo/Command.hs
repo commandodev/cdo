@@ -14,28 +14,25 @@ module Cdo.Command where
 import           Control.Applicative
 import           Control.Exception          (Exception (..), SomeException,
                                              toException)
-
 import           Control.Lens
 import           Control.Monad.Free
-import Data.Traversable (forM, sequence)
--- import           Control.Monad (forever)
-import qualified Control.Monad.Trans.Free   as FT
-import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import Control.Monad.Morph as M
+import           Data.Foldable              (forM_)
+import           Data.Traversable           (forM, sequence)
 import           Control.Monad.IO.Class     (MonadIO, liftIO)
 import           Control.Monad.Reader.Class (MonadReader (..))
-import           Control.Monad.Trans.Class  (MonadTrans, lift)
 import           Control.Monad.RWS.Strict   (MonadReader (..), MonadState (..),
                                              MonadWriter (..), RWST (..), tell)
+-- import           Control.Monad.Trans.Class  (MonadTrans, lift)
 import           Control.Monad.Trans.Either (EitherT (..), eitherT, hoistEither,
                                              left)
--- import           Data.Aeson                 (FromJSON (..), ToJSON (..))
+import qualified Control.Monad.Trans.Free   as FT
+import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import           Control.Monad.Writer.Strict (WriterT, runWriterT)
+import qualified Control.Monad.Writer.Strict as W
 import           Data.Data                  (Typeable)
 import qualified Data.Sequence              as Seq
 import           Data.Text                  (Text)
--- import qualified Data.Text                  as T
--- import qualified Data.Text.Encoding         as T
--- import           Data.UUID                  (UUID)
--- import qualified Data.UUID                  as UUID
 import           Cdo.Query
 import           Cdo.Types
 import           Cdo.Write
@@ -44,7 +41,7 @@ import           Database.Redis             (Redis)
 import qualified Database.Redis             as Redis
 import           GHC.Generics
 -- import Pipes (Consumer, runEffect, (>->))
-import Prelude hiding (sequence)
+import           Prelude                    hiding (sequence)
 -- import qualified Pipes as Pipes
 
 
@@ -67,9 +64,7 @@ redisQuery q f = eitherT queryError f (EitherT $ runQuery q)
 
 ---------------------------------------------------------------------------------
 yieldEvent :: (Show evt, MonadIO m) => evt -> CommandT err evt m ()
-yieldEvent evt = CommandT $ lift $ do
-  liftIO $ print ("yield" :: String, evt)
-  tell $ Seq.singleton evt
+yieldEvent evt = CommandT $ lift $ tell $ Seq.singleton evt
 
 openAccount :: MonadFree CommandF m => AccountName -> m Account
 openAccount acc = liftF $! Open acc id
@@ -123,8 +118,10 @@ instance (Monad m) => MonadReader Env (CommandT err evt m) where
 instance (Monad m) => Alternative (CommandT err evt m) where
   empty = CommandT . left $ CommandError "empty"
   CommandT (EitherT m1) <|> CommandT (EitherT m2) =
-     CommandT $ EitherT $ m1 >>= either (\_ -> m2) (return . Right)
+     CommandT $ EitherT $ m1 >>= either (const m2) (return . Right)
 
+instance (M.MFunctor (CommandT err evt)) where
+  hoist nat m = CommandT . EitherT $ RWST (\r s -> nat (runCommandT m r s))
 ---------------------------------------------------------------------------------
 businessLogicError :: Monad m => err -> CommandT err evt m a
 businessLogicError = CommandT . left . BusinessLogicError
@@ -190,36 +187,34 @@ run
   :: forall a m .(Functor m, Applicative m, MonadIO m)
   => Env
   -> FreeCMD m a
-  -> m (CmdResult a)
+  -> m (CmdResult (Seq.Seq LoggedEvent))
 run env@(Env con) ftc = do
-  (ret, _, evts) <- runCommandT (step ftc) env ()
-  return ret
+  ((ret, _, _), evts) <- runWriterT $ runCommandT (step ftc) env ()
+  return $ const evts <$> ret
   where
-    step :: FreeCMD m a -> CommandT SomeException Event m a
+    step :: FreeCMD m a -> CommandT SomeException Event (WriterT (Seq.Seq LoggedEvent) m) a
     step (FT.FreeT cmd') = do
-      (res, _, evts) <- lift $ runCommandT cmd' env ()
-      -- liftIO $ print ("FIRST runCommandT" :: String, evts)
-      case res of
-        Left err -> CommandT $ left err
-        Right cmd -> do
-          writeResult<- liftIO $ runReaderT (applyAndLog evts) con
-          liftIO $ print writeResult
-          case cmd of
-            FT.Pure a -> return a
-            FT.Free c -> do
-              liftIO $ print (cmdToRep c)
-              step =<< runSingle c
+      cmd <- M.hoist lift cmd'
+      case cmd of
+        FT.Pure a -> return a
+        FT.Free c -> do
+          liftIO $ print (cmdToRep c)
+          (res, _, evts) <- liftIO $ runCommandT (runSingle c) env ()
+          events <- liftIO $ runReaderT (applyAndLog evts) con
+          case (,) <$> res <*> events of
+            Left err -> CommandT $ left err
+            Right (nxt, loggedEvents) -> do
+              forM_ loggedEvents (lift . W.tell . Seq.singleton)
+              step nxt
 
----------------------------------------------------------------------------------
+
 applyAndLog
   :: (MonadReader Redis.Connection m, MonadIO m, Functor m, Applicative m)
   => Seq.Seq Event
   -> m (CmdResult (Seq.Seq LoggedEvent))
 applyAndLog evts = do
   con <- ask
-  liftIO $ print ("APPLY" :: String, evts)
   runEitherT $ forM evts $ \evt -> do
-    liftIO $ print evt
     applyEvent con evt
     let le = LoggedEvent () evt
     logEvent con le
