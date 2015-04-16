@@ -79,6 +79,20 @@ data CommandF n =
   | Credit AccountId Double n
   deriving (Functor)
 
+data CmdRep =
+    OpenR AccountName
+  | CloseR AccountId
+  | DebitR AccountId Double
+  | CreditR AccountId Double
+  deriving Show
+
+cmdToRep :: CommandF n -> CmdRep
+cmdToRep (Open accName _) = OpenR accName
+cmdToRep (Close aid _) = CloseR aid
+cmdToRep (Credit aid n _) = CreditR aid n
+cmdToRep (Debit aid n _) = DebitR aid n
+
+
 data Event =
     AccountOpened Account
   | AccountClosed AccountId
