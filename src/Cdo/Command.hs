@@ -17,12 +17,13 @@ import           Control.Exception          (Exception (..), SomeException,
 
 import           Control.Lens
 import           Control.Monad.Free
+import Data.Traversable (forM, sequence)
 -- import           Control.Monad (forever)
 import qualified Control.Monad.Trans.Free   as FT
 import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
--- import           Control.Monad.IO.Class     (MonadIO, liftIO)
+import           Control.Monad.IO.Class     (MonadIO, liftIO)
 import           Control.Monad.Reader.Class (MonadReader (..))
--- import           Control.Monad.Trans.Class  (MonadTrans, lift)
+import           Control.Monad.Trans.Class  (MonadTrans, lift)
 import           Control.Monad.RWS.Strict   (MonadReader (..), MonadState (..),
                                              MonadWriter (..), RWST (..), tell)
 import           Control.Monad.Trans.Either (EitherT (..), eitherT, hoistEither,
@@ -42,7 +43,10 @@ import qualified Data.UUID.V4               as UUID
 import           Database.Redis             (Redis)
 import qualified Database.Redis             as Redis
 import           GHC.Generics
-import           Pipes
+-- import Pipes (Consumer, runEffect, (>->))
+import Prelude hiding (sequence)
+-- import qualified Pipes as Pipes
+
 
 
 newtype Query a = Query { unQuery :: (Redis a) } deriving (Functor, Applicative, Monad)
@@ -62,8 +66,10 @@ redisQuery
 redisQuery q f = eitherT queryError f (EitherT $ runQuery q)
 
 ---------------------------------------------------------------------------------
-yieldEvent :: Monad m => evt -> CommandT err evt m ()
-yieldEvent evt = CommandT $ lift  $ tell $ Seq.singleton evt
+yieldEvent :: (Show evt, MonadIO m) => evt -> CommandT err evt m ()
+yieldEvent evt = CommandT $ lift $ do
+  liftIO $ print ("yield" :: String, evt)
+  tell $ Seq.singleton evt
 
 openAccount :: MonadFree CommandF m => AccountName -> m Account
 openAccount acc = liftF $! Open acc id
@@ -178,9 +184,54 @@ runSingle = go
                return nxt
 
 ---------------------------------------------------------------------------------
-applyEvent :: forall m. (MonadIO m) => Redis.Connection -> Event -> m (CmdResult ())
-applyEvent con evt = do
-  case evt of
+type FreeCMD m = FT.FreeT CommandF (CommandT SomeException Event m)
+
+run
+  :: forall a m .(Functor m, Applicative m, MonadIO m)
+  => Env
+  -> FreeCMD m a
+  -> m (CmdResult a)
+run env@(Env con) ftc = do
+  (ret, _, evts) <- runCommandT (step ftc) env ()
+  return ret
+  where
+    step :: FreeCMD m a -> CommandT SomeException Event m a
+    step (FT.FreeT cmd') = do
+      (res, _, evts) <- lift $ runCommandT cmd' env ()
+      -- liftIO $ print ("FIRST runCommandT" :: String, evts)
+      case res of
+        Left err -> CommandT $ left err
+        Right cmd -> do
+          writeResult<- liftIO $ runReaderT (applyAndLog evts) con
+          liftIO $ print writeResult
+          case cmd of
+            FT.Pure a -> return a
+            FT.Free c -> do
+              liftIO $ print (cmdToRep c)
+              step =<< runSingle c
+
+---------------------------------------------------------------------------------
+applyAndLog
+  :: (MonadReader Redis.Connection m, MonadIO m, Functor m, Applicative m)
+  => Seq.Seq Event
+  -> m (CmdResult (Seq.Seq LoggedEvent))
+applyAndLog evts = do
+  con <- ask
+  liftIO $ print ("APPLY" :: String, evts)
+  runEitherT $ forM evts $ \evt -> do
+    liftIO $ print evt
+    applyEvent con evt
+    let le = LoggedEvent () evt
+    logEvent con le
+    return le
+
+applyEvent
+  :: forall m. (MonadIO m)
+  => Redis.Connection
+  -> Event
+  -> EitherT (CommandError SomeException) m ()
+applyEvent con evt =
+  EitherT $ case evt of
     AccountOpened acc -> apply (writeAccount acc)
     AccountCredited aid amt -> apply (saveAmount aid amt)
   where
@@ -197,45 +248,13 @@ applyEvent con evt = do
                      _             -> "Something went wrong with redis"
 
 
----------------------------------------------------------------------------------
-type FreeCMD m = FT.FreeT CommandF (CommandT SomeException Event m)
-
-run
-  :: forall a m .(Functor m, Applicative m, MonadIO m)
-  => Env
-  -> FreeCMD m a
-  -> m (CmdResult ())
-run env@(Env con) ftc = do
-  (res, _, evts) <- runCommandT (step ftc) env ()
-  case res of
-    Left err -> do
-      liftIO $ print err
-      return $ Left err
-    Right _ -> return $ Right ()
-  --runEffect $ for cmdRes $ \a -> lift $ print a
-  -- runEffect ((void <$> evts) >-> writeEvents con)
-  where
-    step :: (MonadIO m) => FreeCMD m a -> CommandT SomeException evt m a
-    step (FT.FreeT cmd') = do
-      cmd <- runProducer cmd' undefined -- (const $ return ())
-      case cmd of
-        FT.Pure a -> return a
-        FT.Free c -> do
-          let sngl = runSingle c
-          step =<< runProducer sngl (applyAndLog con)
-
-applyAndLog :: MonadIO m => Redis.Connection -> Event -> EventMonad m (CmdResult a)
-applyAndLog evt = do
-  
-  lift $ do
-    applyEvent con evt
-    logEvent con (LoggedEvent () evt)
-
-type EventMonad = ReaderT Redis.Connection
-
-logEvent :: MonadIO m => Redis.Connection -> LoggedEvent -> m (CmdResult ())
+logEvent
+  :: MonadIO m
+  => Redis.Connection
+  -> LoggedEvent
+  -> EitherT (CommandError SomeException) m ()
 logEvent con evt =
-  runEitherT $ eitherT
+  eitherT
     writeError'
     (const $ return ())
     (EitherT $ liftIO $  Redis.runRedis con $ writeEvent evt)
@@ -245,6 +264,7 @@ logEvent con evt =
                 Redis.Error e -> e
                 _             -> "Something went wrong with redis"
 
+---------------------------------------------------------------------------------
 mainM :: MonadFree CommandF m => m ()
 mainM = do
   acc <- openAccount "Ben"
@@ -254,10 +274,3 @@ main :: IO ()
 main = do
   env <- Env <$> Redis.connect Redis.defaultConnectInfo
   print =<< run env mainM
-
-runProducer :: (MonadIO m) => CommandT SomeException evt m a -> Consumer evt m (CmdResult a) -> CommandT SomeException evt m a
-runProducer m eff = do
-  env <- ask
-  let prod = runCommandT m env
-  res <- lift $ runEffect $ prod >-> eff
-  CommandT $ hoistEither res
