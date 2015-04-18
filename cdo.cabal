@@ -29,6 +29,7 @@ library
                      , bytestring >= 0.10.4.0
                      , containers >= 0.5.5.1
                      , either >= 4.3.3.2
+                     , errors >= 1.4.7
                      , free
                      , hedis >= 0.6.5
                      , lens
