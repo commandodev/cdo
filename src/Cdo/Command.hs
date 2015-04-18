@@ -18,16 +18,15 @@ import           Control.Lens
 import           Control.Monad.Free
 import Control.Monad.Morph as M
 import           Data.Foldable              (forM_)
-import           Data.Traversable           (forM, sequence)
+import           Data.Traversable           (forM)
 import           Control.Monad.IO.Class     (MonadIO, liftIO)
-import           Control.Monad.Reader.Class (MonadReader (..))
 import           Control.Monad.RWS.Strict   (MonadReader (..), MonadState (..),
                                              MonadWriter (..), RWST (..), tell)
 -- import           Control.Monad.Trans.Class  (MonadTrans, lift)
-import           Control.Monad.Trans.Either (EitherT (..), eitherT, hoistEither,
+import           Control.Monad.Trans.Either (EitherT (..), eitherT,
                                              left)
 import qualified Control.Monad.Trans.Free   as FT
-import           Control.Monad.Trans.Reader (ReaderT, runReaderT)
+import           Control.Monad.Trans.Reader (runReaderT)
 import           Control.Monad.Writer.Strict (WriterT, runWriterT)
 import qualified Control.Monad.Writer.Strict as W
 import           Data.Data                  (Typeable)
@@ -155,15 +154,13 @@ runSingle = go
 
     go (Credit aid amount nxt) = redisQuery (accountBalance aid) creditAccount'
       where
-        creditAccount' Nothing = businessLogicError . toException $ AccountBalanceNotFound aid
-        creditAccount' (Just _) = do
+        creditAccount' _ = do
           yieldEvent (AccountCredited aid (Amount amount))
           return nxt
 
     go (Debit aid amount nxt) = redisQuery (accountBalance aid) debitAccount'
       where
-        debitAccount' Nothing = businessLogicError . toException $ AccountBalanceNotFound aid
-        debitAccount' (Just (Amount n)) =
+        debitAccount' (Amount n) =
           if n < amount
              then businessLogicError . toException $ AccountBalanceInsufficient
              else do
@@ -172,8 +169,7 @@ runSingle = go
 
     go (Close aid nxt) = redisQuery (accountBalance aid) closeAccount'
       where
-        closeAccount' Nothing = businessLogicError . toException $ AccountBalanceNotFound aid
-        closeAccount' (Just (Amount n)) =
+        closeAccount' (Amount n) =
           if n /= 0
              then businessLogicError . toException $ AccountStillHasBalance aid
              else do
@@ -217,7 +213,8 @@ applyAndLog evts = do
   runEitherT $ forM evts $ \evt -> do
     applyEvent con evt
     let le = LoggedEvent () evt
-    logEvent con le
+    i <- logEvent con le
+    liftIO $ print (i, "Events" :: String)
     return le
 
 applyEvent
@@ -228,7 +225,7 @@ applyEvent
 applyEvent con evt =
   EitherT $ case evt of
     AccountOpened acc -> apply (writeAccount acc)
-    AccountCredited aid amt -> apply (saveAmount aid amt)
+    AccountCredited aid amt -> apply (changeAmount aid amt)
   where
     apply :: Redis (Either Redis.Reply a) -> m (CmdResult ())
     apply q =
@@ -247,11 +244,11 @@ logEvent
   :: MonadIO m
   => Redis.Connection
   -> LoggedEvent
-  -> EitherT (CommandError SomeException) m ()
+  -> EitherT (CommandError SomeException) m Integer
 logEvent con evt =
   eitherT
     writeError'
-    (const $ return ())
+    return
     (EitherT $ liftIO $  Redis.runRedis con $ writeEvent evt)
   where
     writeError' r = left . QueryError . toException $ QueryException err
@@ -260,12 +257,13 @@ logEvent con evt =
                 _             -> "Something went wrong with redis"
 
 ---------------------------------------------------------------------------------
-mainM :: MonadFree CommandF m => m ()
+mainM :: MonadIO m => FreeCMD m () -- MonadFree CommandF m => m ()
 mainM = do
-  acc <- openAccount "Ben"
+  Right acc <- lift $ runQuery $ getAccount "Ben"
   creditAccount (acc ^. accId) 100
 
 main :: IO ()
 main = do
   env <- Env <$> Redis.connect Redis.defaultConnectInfo
   print =<< run env mainM
+  print =<< Redis.runRedis (env ^. conn) (getAccount "Ben")

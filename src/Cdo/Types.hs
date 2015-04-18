@@ -59,7 +59,7 @@ makeWrapped ''AccountId
 
 newtype Amount = Amount {
     unAmount :: Double
-  } deriving (Show, Eq, Ord, Data, Generic, Typeable, ToJSON, FromJSON)
+  } deriving (Show, Eq, Ord, Num, Data, Generic, Typeable, ToJSON, FromJSON)
 
 data Account = Account {
     _accId      :: AccountId
@@ -87,7 +87,7 @@ data CmdRep =
   deriving Show
 
 cmdToRep :: CommandF n -> CmdRep
-cmdToRep (Open accName _) = OpenR accName
+cmdToRep (Open aname _) = OpenR aname
 cmdToRep (Close aid _) = CloseR aid
 cmdToRep (Credit aid n _) = CreditR aid n
 cmdToRep (Debit aid n _) = DebitR aid n
