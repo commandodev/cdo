@@ -29,9 +29,9 @@ getAccountById :: (RedisCtx m (Either Reply), Functor m) => AccountId -> m (Eith
 getAccountById aid = do
   Right hm <- hGetHashMap aid
   return $ Account aid <$> (T.decodeUtf8 <$> hm .: "name")
-                       <*> (hm .: "balance" >>= (err "Couldn't parse balance" . parseAmount))
+                       <*> (hm .: "balance" >>= (redisError "Couldn't parse balance" . parseAmount))
   where
-    hm .: k = (err $ "Couldn't find key " <> k) $ (hm ^. at k)
+    hm .: k = (redisError $ "Couldn't find key " <> k) $ (hm ^. at k)
 
 mkAccountNameKey :: AccountName -> ByteString
 mkAccountNameKey name = "account-name:" <> T.encodeUtf8 name
@@ -45,19 +45,19 @@ accountExists = exists . mkAccountNameKey
 accountBalance :: (RedisCtx m (Either Reply)) => AccountId -> m (Either Reply Amount)
 accountBalance aid = do
   Right bal <- hget (mkAccountKey aid) "balance"
-  return $ note (Error "Couldn't parse amount") $ join (parseAmount <$> bal)
+  return $ redisError "Couldn't parse amount" $ join (parseAmount <$> bal)
 
 getAccount :: (RedisCtx m (Either Reply)) => AccountName -> m (Either Reply Account)
 getAccount name = runEitherT $ do
   uuid' <- EitherT $ get (mkAccountNameKey name)
-  uuid <- AccountId <$> (EitherT . return . err "Couldn't parse UUID" $ UUID.fromASCIIBytes =<< uuid')
+  uuid <- AccountId <$> (EitherT . return . redisError "Couldn't parse UUID" $ UUID.fromASCIIBytes =<< uuid')
   bal <- EitherT $ accountBalance uuid
   return $ Account uuid name bal
-  where 
+  where
 
 parseAmount :: ByteString -> Maybe Amount
 parseAmount bs = Amount <$> either (const Nothing) Just (parseOnly double bs)
 
 
-err :: ByteString -> Maybe b -> Either Reply b
-err msg = note (Error msg)
+redisError :: ByteString -> Maybe b -> Either Reply b
+redisError msg = note (Error msg)

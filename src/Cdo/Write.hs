@@ -5,6 +5,7 @@ module Cdo.Write where
 
 import           Cdo.Query
 import           Cdo.Types
+import           Control.Lens         hiding (set)
 import           Data.Aeson           (ToJSON)
 import qualified Data.Aeson           as Aeson
 import qualified Data.ByteString.Lazy as LBS
@@ -32,5 +33,7 @@ writeAccount (Account aid name (Amount amt)) = do
           , ("balance", fromString (show amt))
           ]
 
-deleteAccount :: RedisCtx m f => AccountId -> m (f Integer)
-deleteAccount aid = del [mkAccountKey aid]
+deleteAccount :: (RedisCtx m (Either Reply), Functor m) => AccountId -> m (Either Reply Integer)
+deleteAccount aid = do
+  Right acc <- getAccountById aid
+  del [mkAccountKey aid, mkAccountNameKey (acc ^. accName)]

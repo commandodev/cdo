@@ -227,6 +227,7 @@ applyEvent con evt =
     AccountOpened acc -> apply (writeAccount acc)
     AccountCredited aid amt -> apply (changeAmount aid amt)
     AccountDebited aid amt -> apply (changeAmount aid (-amt))
+    AccountClosed aid -> apply (deleteAccount aid)
   where
     apply :: Redis (Either Redis.Reply a) -> m (CmdResult ())
     apply q =
@@ -263,6 +264,8 @@ mainM = do
   -- Right acc <- lift $ runQuery $ getAccount "Ben"
   acc <- openAccount "Ben"
   creditAccount (acc ^. accId) 100
+  debitAccount (acc ^. accId) 100
+  closeAccount (acc ^. accId)
 
 main :: IO ()
 main = do
