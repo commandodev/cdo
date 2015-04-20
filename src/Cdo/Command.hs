@@ -20,7 +20,7 @@ import Control.Monad.Morph as M
 import           Data.Foldable              (forM_)
 import           Data.Traversable           (forM)
 import           Control.Monad.IO.Class     (MonadIO, liftIO)
-import           Control.Monad.RWS.Strict   (MonadReader (..), MonadState (..),
+import           Control.Monad.RWS.Strict   (MonadReader (..),
                                              MonadWriter (..), RWST (..), tell)
 -- import           Control.Monad.Trans.Class  (MonadTrans, lift)
 import           Control.Monad.Trans.Either (EitherT (..), eitherT,
@@ -226,6 +226,7 @@ applyEvent con evt =
   EitherT $ case evt of
     AccountOpened acc -> apply (writeAccount acc)
     AccountCredited aid amt -> apply (changeAmount aid amt)
+    AccountDebited aid amt -> apply (changeAmount aid (-amt))
   where
     apply :: Redis (Either Redis.Reply a) -> m (CmdResult ())
     apply q =
@@ -259,7 +260,8 @@ logEvent con evt =
 ---------------------------------------------------------------------------------
 mainM :: MonadIO m => FreeCMD m () -- MonadFree CommandF m => m ()
 mainM = do
-  Right acc <- lift $ runQuery $ getAccount "Ben"
+  -- Right acc <- lift $ runQuery $ getAccount "Ben"
+  acc <- openAccount "Ben"
   creditAccount (acc ^. accId) 100
 
 main :: IO ()
